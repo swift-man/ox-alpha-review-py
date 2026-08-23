@@ -78,6 +78,8 @@ review:
 
   always_review:
     - ".reviewbot.yml"
+    - ".gitignore"
+    - ".env.example"
     - "AGENTS.md"
     - "docs/compatibility-matrix.md"
     - "pyproject.toml"

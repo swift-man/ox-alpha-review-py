@@ -42,6 +42,34 @@ When availability and zero-cost safety conflict, choose safety and refuse servic
 Any change touching these invariants requires tests proving the completion transport
 is not called when a guard fails.
 
+## Environment contract
+
+The tracked `.env.example` is the canonical runtime configuration template. A local
+`.env` may contain secrets, must have mode `0600`, and must never be committed. Do not
+create secret-bearing `scripts/local_review_env.sh` files.
+
+Required operator-supplied values:
+
+- `GITHUB_APP_ID` for the newly created Ox Alpha GitHub App.
+- Exactly one of `GITHUB_APP_PRIVATE_KEY_PATH` or `GITHUB_APP_PRIVATE_KEY`; prefer a
+  mode-`0600` key file outside the repository.
+- `GITHUB_WEBHOOK_SECRET`, newly generated for this App and not reused from another
+  review bot.
+- `OPENROUTER_API_KEY`, an inference-only key for the dedicated Free-tier account.
+  It must not be a management/provisioning key.
+- `GITHUB_APP_SLUG` must match the new App for follow-ups and meta replies, unless the
+  implementation obtains and verifies the slug from GitHub at startup.
+
+Safe runtime settings may expose only bounded operational values such as
+`GITHUB_API_BASE`, `HOST`, `PORT`, `DRY_RUN`, `REPO_CACHE_DIR`, `GIT_TIMEOUT_SEC`,
+`FILE_MAX_BYTES`, `DATA_FILE_MAX_BYTES`, `WEBHOOK_MAX_BODY_BYTES`, and
+`REVIEW_QUEUE_MAXSIZE`. Version 0.1 must require `REVIEW_CONCURRENCY=1`.
+
+Do not accept environment overrides for the OpenRouter base URL, model, provider,
+fallback behavior, price ceilings, service tier, tools/plugins, BYOK, rolling quota
+limit, safety latch, acceptance record, or production-readiness decision. Reject any
+management key or reserved override rather than silently ignoring it.
+
 ## Architecture and dependency direction
 
 Use four layers with dependencies pointing inward:
