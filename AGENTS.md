@@ -162,7 +162,9 @@ infrastructure (GitHub, OpenRouter, Git, SQLite adapters)
 
 ## Security and privacy
 
-- Verify webhook HMAC against the raw bounded body before JSON parsing or queueing.
+- Verify `X-Hub-Signature-256` against the raw bounded body with
+  `hmac.compare_digest` before JSON parsing or queueing. Reject missing, malformed,
+  or mismatched signatures; never use ordinary string equality for this comparison.
 - Treat PR metadata, paths, patches, history, and repository contents as untrusted.
 - Reject symlink/path escapes using resolved-root checks before reading file content.
 - Never log API keys, GitHub tokens, webhook secrets, PEM data, repository source,
