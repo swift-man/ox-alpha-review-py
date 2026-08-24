@@ -16,12 +16,14 @@ When availability and zero-cost safety conflict, choose safety and refuse servic
   `only: ["stealth"]`, `allow_fallbacks: false`, and
   `require_parameters: true`.
 - Set every supported `provider.max_price` field to the string `"0"`.
-- Use a dedicated Free-tier API key with a verified USD 0 spending limit, no payment
-  method, no purchased credits, no auto top-up, and no BYOK configuration.
-- Keep production readiness disabled until OpenRouter confirms in writing that the
-  USD 0 key limit is a hard pre-authorization ceiling with no overage, negative
-  balance, or invoice path. A successful free smoke call is only a compatibility
-  check, not proof of billing semantics.
+- Use a dedicated, never-funded Free-tier API key with no payment method, purchased
+  credits, auto top-up, or BYOK configuration. OpenRouter documents API `limit: null`
+  as unlimited, and dashboard key limit `0` also means unlimited; neither value is a
+  zero-cost safety control and the implementation must never describe it as one.
+- Keep production readiness disabled until OpenRouter confirms in writing that
+  `provider.max_price` set to zero is a hard pre-authorization ceiling that rejects
+  every nonzero price with no overage, negative balance, or invoice path. A successful
+  free smoke call is only a compatibility check, not proof of billing semantics.
 - Never add `openrouter/free`, model aliases, `:free`/`:floor` variants, alternate
   providers, paid fallbacks, account rotation, tools, plugins, server tools, web
   search, caching, or non-default service tiers.

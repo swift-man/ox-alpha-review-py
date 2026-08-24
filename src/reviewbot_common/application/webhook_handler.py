@@ -1,0 +1,467 @@
+import asyncio
+import contextlib
+import hashlib
+import hmac
+import logging
+from dataclasses import dataclass
+from typing import Any
+
+from reviewbot_common.domain import PullRequest, RepoRef
+from reviewbot_common.interfaces import (
+    DeliveryStore,
+    GitHubClient,
+    PullRequestNotReviewableError,
+)
+from reviewbot_common.logging_utils import get_delivery_logger
+
+from .follow_up_use_case import FollowUpReviewUseCase
+from .review_pr_use_case import ReviewPullRequestUseCase
+
+logger = logging.getLogger(__name__)
+
+_SUPPORTED_ACTIONS = {"opened", "synchronize", "reopened", "ready_for_review"}
+
+# follow-up 은 새 push 가 의미 있는 시점에만 실행 — 신규 PR(opened) 이나 draft 해제
+# (ready_for_review) 에는 옛 코멘트 자체가 없을 가능성이 크고, 있더라도 main review 가
+# 어차피 새 review 를 게시하므로 중복 트래픽을 만든다. `synchronize` (커밋 push) 와
+# `reopened` (재오픈) 만이 "이전 코멘트가 아직 유효한가?" 를 판정해야 할 시점.
+_FOLLOWUP_ACTIONS = {"synchronize", "reopened"}
+
+# Graceful shutdown 의 기본 타임아웃(초). 진행 중 리뷰가 이보다 오래 걸리면 강제 취소.
+_DEFAULT_SHUTDOWN_TIMEOUT = 60.0
+
+# 큐가 가득 차 거절할 때 운영자가 볼 상한. 기본은 동시성 × 10 으로 잡아 일시적 버스트를
+# 흡수하되 메모리가 무한히 쌓이지 않도록 한다.
+_DEFAULT_QUEUE_MULTIPLIER = 10
+
+
+def _coerce_positive_int(value: object) -> int | None:
+    """webhook payload 의 `pull_request.number`, `installation.id` 처럼 반드시 양의
+    정수여야 하는 필드를 안전하게 변환한다.
+
+    - bool 은 `isinstance(True, int) == True` 때문에 `int(...)` 가 조용히 1/0 으로
+      통과시킨다 → 명시적으로 차단 (webhook payload 에 bool 이 오면 스키마 위반).
+    - 그 외 변환 실패(문자열·None·dict·float) 는 `None` 으로 수렴시켜 호출자가
+      400 을 돌려주도록 한다.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if isinstance(value, str):
+        try:
+            parsed = int(value)
+        except ValueError:
+            return None
+        return parsed if parsed > 0 else None
+    return None
+
+
+@dataclass(frozen=True)
+class WebhookJob:
+    delivery_id: str
+    repo: RepoRef
+    number: int
+    installation_id: int
+    # GitHub PR webhook 의 `action` 필드 (예: "opened", "synchronize", "reopened",
+    # "ready_for_review"). follow-up 처리는 새 push 인 "synchronize" 와 다시 열림 시점인
+    # "reopened" 에서만 의미가 있어 worker 가 분기에 사용한다.
+    action: str = ""
+
+
+class WebhookHandler:
+    """Verifies webhooks, enqueues review jobs, drains them with bounded concurrency.
+
+    구조:
+      asyncio.Queue(maxsize=Q) <- `accept()` 가 `put_nowait`. 가득 차면 503.
+      N 개의 워커 코루틴         <- 큐에서 꺼내 순차 처리. 워커 수 자체가 동시 실행 상한
+                                     이므로 별도 Semaphore 는 불필요 (Gemini 지적 반영).
+    """
+
+    def __init__(
+        self,
+        secret: str,
+        github: GitHubClient,
+        use_case: ReviewPullRequestUseCase,
+        concurrency: int = 1,
+        queue_maxsize: int | None = None,
+        shutdown_timeout: float = _DEFAULT_SHUTDOWN_TIMEOUT,
+        follow_up_use_case: "FollowUpReviewUseCase | None" = None,
+        delivery_store: DeliveryStore | None = None,
+    ) -> None:
+        # 이 클래스에 도달하기 전에 `Settings` 계층이 `concurrency > 0`, `queue_maxsize
+        # is None or > 0` 을 강제하므로 런타임 방어(`max(1, …)`) 는 제거했다 —
+        # 설정과 비즈니스 로직 사이 신뢰 경계를 명확하게 (gemini 리뷰).
+        if concurrency <= 0:
+            # 직접 생성 경로(테스트 등) 의 오용 방어를 최소한으로 유지.
+            raise ValueError(f"concurrency must be > 0; got {concurrency}")
+        self._secret = secret.encode("utf-8")
+        self._github = github
+        self._use_case = use_case
+        # follow-up 은 옵트인 — Settings.GITHUB_APP_SLUG 가 설정된 경우에만 wiring 됨.
+        # None 이면 기존 main-review-only 흐름 유지.
+        self._follow_up_use_case = follow_up_use_case
+        self._delivery_store = delivery_store
+        self._concurrency = concurrency
+        qmax = (
+            queue_maxsize
+            if queue_maxsize is not None
+            else (self._concurrency * _DEFAULT_QUEUE_MULTIPLIER)
+        )
+        # `None` tombstone 으로 graceful shutdown 신호를 보낸다 — 워커가 pop 시 빠져나옴.
+        self._queue: asyncio.Queue[WebhookJob | None] = asyncio.Queue(maxsize=qmax)
+        self._workers: list[asyncio.Task[None]] = []
+        self._shutdown_timeout = shutdown_timeout
+        self._stopping = False
+        self._fatal_error: str | None = None
+
+    # --- Lifecycle ----------------------------------------------------------
+
+    async def start(self) -> None:
+        if self._workers:
+            return
+        if self._fatal_error is not None:
+            raise RuntimeError("webhook handler cannot restart after a fatal worker failure")
+        self._stopping = False
+        # 워커 개수 = 동시 실행 상한. 각 워커가 큐에서 꺼내 바로 처리하므로 Semaphore 가
+        # 있어도 중복된 락 오버헤드일 뿐이다.
+        for i in range(self._concurrency):
+            task = asyncio.create_task(self._run(), name=f"review-worker-{i}")
+            self._workers.append(task)
+        logger.info(
+            "webhook handler started: concurrency=%d queue_maxsize=%d",
+            self._concurrency,
+            self._queue.maxsize,
+        )
+
+    def health_status(self) -> tuple[bool, str]:
+        if self._fatal_error is not None:
+            return False, self._fatal_error
+        if self._workers and not self._stopping and any(task.done() for task in self._workers):
+            return False, "review worker stopped unexpectedly"
+        return True, "ready"
+
+    async def stop(self) -> None:
+        """Graceful shutdown — 진행 중 리뷰는 끝까지, 큐 대기분은 drop 후 종료.
+
+        순서:
+          1) 큐에서 '아직 워커가 꺼내지 않은' job 을 먼저 비운다 (GitHub 가 재전송하거나
+             운영자가 수동 재처리). busy 워커 본인은 건드리지 않으므로 진행 중 리뷰는
+             그대로 완료까지 진행된다.
+          2) 이제 확보된 큐 공간에 worker 수만큼 tombstone 을 `put_nowait` — 블로킹 없음.
+          3) `shutdown_timeout` 동안 tombstone 도달 후 자연 종료를 기다린다.
+          4) 타임아웃을 초과하면 그때서야 `cancel()` 로 강제 종료.
+
+        이전 구현은 큐가 가득 찬 상태에서 `put_nowait` 이 실패하자마자 즉시
+        `_cancel_workers()` 로 진행 중 리뷰까지 죽였다 — Gemini 지적.
+        """
+        self._stopping = True
+        dropped = await self._drain_pending_jobs()
+
+        failed_tombstone = False
+        for _ in self._workers:
+            try:
+                self._queue.put_nowait(None)
+            except asyncio.QueueFull:
+                # maxsize < concurrency 인 엣지 케이스에만 해당. graceful 보장이 어렵다.
+                logger.warning(
+                    "cannot enqueue tombstone after draining %d job(s); "
+                    "queue_maxsize=%d < concurrency=%d",
+                    dropped,
+                    self._queue.maxsize,
+                    self._concurrency,
+                )
+                failed_tombstone = True
+                break
+
+        if not failed_tombstone:
+            try:
+                async with asyncio.timeout(self._shutdown_timeout):
+                    await asyncio.gather(*self._workers, return_exceptions=True)
+            except TimeoutError:
+                logger.warning(
+                    "graceful shutdown exceeded %.0fs; cancelling workers",
+                    self._shutdown_timeout,
+                )
+                self._cancel_workers()
+        else:
+            self._cancel_workers()
+
+        # 최종 정리 — CancelledError 는 정상 신호로 suppress, 다른 예외는 가시성 위해 로그.
+        for task in self._workers:
+            with contextlib.suppress(asyncio.CancelledError):
+                try:
+                    await task
+                except Exception:
+                    logger.exception("worker task crashed during shutdown")
+
+        self._workers.clear()
+        logger.info("webhook handler stopped (dropped %d pending job(s) at shutdown)", dropped)
+
+    async def _drain_pending_jobs(self) -> int:
+        """큐에 남아 있는 `WebhookJob` 만 버려서 tombstone 삽입 공간을 확보.
+
+        이 메서드는 워커가 실제로 '처리 중' 인 job 은 건드리지 않는다 — 그 job 은 이미
+        `queue.get()` 으로 꺼내져 워커 로컬 상태에 있기 때문. 따라서 '취소하지 않고
+        완료까지 기다린다' 는 graceful 의 계약은 유지된다.
+
+        tombstone(None) 이 어떤 이유로 이미 들어 있다면 다시 삽입할 것이므로 여기서
+        함께 비워도 무방하다.
+        """
+        dropped = 0
+        while True:
+            try:
+                item = self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            self._queue.task_done()
+            if item is None:
+                continue
+            dropped += 1
+            if self._delivery_store is not None:
+                try:
+                    await self._delivery_store.abandon(item.delivery_id)
+                except Exception:
+                    logger.exception(
+                        "failed to release dropped webhook delivery=%s",
+                        item.delivery_id,
+                    )
+            logger.warning(
+                "dropping pending webhook at shutdown: %s#%d (delivery=%s)",
+                item.repo.full_name,
+                item.number,
+                item.delivery_id,
+            )
+        return dropped
+
+    def _cancel_workers(self) -> None:
+        for task in self._workers:
+            task.cancel()
+
+    # --- Verification -------------------------------------------------------
+
+    def verify_signature(self, signature_header: str | None, body: bytes) -> bool:
+        # 원문 body 로 HMAC 계산. json.loads 후 재직렬화하면 서명이 달라져 정상 요청 거부.
+        if not signature_header or not signature_header.startswith("sha256="):
+            return False
+        expected = hmac.new(self._secret, body, hashlib.sha256).hexdigest()
+        return hmac.compare_digest(signature_header.removeprefix("sha256="), expected)
+
+    # --- Dispatch -----------------------------------------------------------
+
+    async def accept(
+        self,
+        event: str,
+        delivery_id: str,
+        payload: dict[str, Any],
+    ) -> tuple[int, str]:
+        dlog = get_delivery_logger(__name__, delivery_id)
+        if event == "ping":
+            return 200, "pong"
+        healthy, _ = self.health_status()
+        if not healthy:
+            dlog.error("rejecting webhook because review worker is unhealthy")
+            return 503, "worker-unhealthy"
+        if self._stopping:
+            dlog.warning("rejecting webhook during shutdown")
+            return 503, "shutting-down"
+        if event != "pull_request":
+            dlog.info("ignoring event: %s", event)
+            return 202, "ignored"
+        if not delivery_id or delivery_id == "-":
+            dlog.warning("missing GitHub delivery id")
+            return 400, "missing-delivery-id"
+
+        action = str(payload.get("action", ""))
+        if action not in _SUPPORTED_ACTIONS:
+            dlog.info("ignoring action: %s", action)
+            return 202, "ignored-action"
+
+        raw_pr = payload.get("pull_request")
+        pr = raw_pr if isinstance(raw_pr, dict) else {}
+        # webhook payload 의 draft 값과 실제 처리 시점 상태가 다를 수 있어 _process 에서 재확인.
+        if action != "ready_for_review" and bool(pr.get("draft")):
+            dlog.info("skipping draft PR")
+            return 202, "skipped-draft"
+
+        raw_repo = payload.get("repository")
+        repo = raw_repo if isinstance(raw_repo, dict) else {}
+        repo_full = str(repo.get("full_name", ""))
+        if "/" not in repo_full:
+            dlog.warning("missing repository full_name in payload")
+            return 400, "invalid-payload"
+        owner, name = repo_full.split("/", 1)
+
+        # 외부 입력 경계 — `int(...)` 직접 호출은 악의적 payload (중첩 dict, "NaN", bool 등)
+        # 에서 ValueError/TypeError 를 던져 FastAPI 가 500 으로 올려 보낸다. 모든 타입 오류는
+        # 일관되게 400 으로 수렴시키는 편이 운영·공격 탐지 측면에서 안전.
+        installation = payload.get("installation")
+        raw_installation_id = installation.get("id") if isinstance(installation, dict) else None
+        number = _coerce_positive_int(pr.get("number"))
+        installation_id = _coerce_positive_int(raw_installation_id)
+        if number is None or installation_id is None:
+            dlog.warning(
+                "invalid or missing number=%r or installation_id=%r",
+                pr.get("number"),
+                raw_installation_id,
+            )
+            return 400, "invalid-payload"
+
+        job = WebhookJob(
+            delivery_id=delivery_id,
+            repo=RepoRef(owner=owner, name=name),
+            number=number,
+            installation_id=installation_id,
+            action=action,
+        )
+        if self._delivery_store is not None:
+            claimed = await self._delivery_store.claim(delivery_id)
+            if not claimed:
+                dlog.info("ignoring duplicate delivery")
+                return 202, "duplicate"
+            # `claim()` is an await boundary. The sole worker may become fatal while
+            # this request is waiting on SQLite, so re-check immediately before the
+            # non-awaiting enqueue operation and release the claim if processing is
+            # no longer possible.
+            healthy, _ = self.health_status()
+            if not healthy:
+                await self._delivery_store.abandon(delivery_id)
+                return 503, "worker-unhealthy"
+            if self._stopping:
+                await self._delivery_store.abandon(delivery_id)
+                return 503, "shutting-down"
+        # 큐가 가득 차면 즉시 거절 — GitHub 가 재전송하거나 운영자가 원인을 찾도록.
+        # 무제한 큐는 Codex 쿼터 장애·장시간 리뷰 시 메모리와 대기시간을 무한 증가시킬 수 있다.
+        try:
+            self._queue.put_nowait(job)
+        except asyncio.QueueFull:
+            if self._delivery_store is not None:
+                await self._delivery_store.abandon(delivery_id)
+            dlog.warning(
+                "webhook queue full (maxsize=%d); rejecting %s#%d",
+                self._queue.maxsize,
+                job.repo.full_name,
+                job.number,
+            )
+            return 503, "queue-full"
+
+        dlog.info(
+            "queued review for %s#%d (queue_depth=%d/%d)",
+            job.repo.full_name,
+            job.number,
+            self._queue.qsize(),
+            self._queue.maxsize,
+        )
+        return 202, "queued"
+
+    # --- Worker -------------------------------------------------------------
+
+    async def _run(self) -> None:
+        # 워커 수가 곧 동시성 상한. 별도 semaphore 없이 바로 처리 — 단순화.
+        while True:
+            job = await self._queue.get()
+            try:
+                if job is None:
+                    # Graceful shutdown tombstone. 워커 하나를 종료.
+                    return
+                try:
+                    await self._process(job)
+                finally:
+                    if self._delivery_store is not None:
+                        try:
+                            await self._delivery_store.finish(job.delivery_id)
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            self._fatal_error = "delivery completion persistence failed"
+                            self._stopping = True
+                            dropped = await self._drain_pending_jobs()
+                            logger.exception(
+                                "delivery completion persistence failed; stopping worker "
+                                "after releasing %d queued delivery claim(s)",
+                                dropped,
+                            )
+                            return
+            finally:
+                self._queue.task_done()
+
+    async def _process(self, job: WebhookJob) -> None:
+        dlog = get_delivery_logger(__name__, job.delivery_id)
+        try:
+            dlog.info("processing %s#%d", job.repo.full_name, job.number)
+            pr = await self._github.fetch_pull_request(job.repo, job.number, job.installation_id)
+            if pr.is_draft:
+                dlog.info("skipping draft at fetch time")
+                return
+
+            # ── Follow-up (Phase 1) — 새 push / 재오픈 시에만 의미 ──────────
+            # main review 가 새 review 를 추가 게시하기 전에, 기존 봇 코멘트가 새
+            # 커밋으로 자동 해소됐는지 먼저 정리한다 (PR 사이드바 unresolved 카운트
+            # 가 즉시 줄어 PR 페이지 가독성 향상).
+            #
+            # 절대 main review 를 가로막지 않는다 — follow-up 자체 실패는 로그로만
+            # 남기고 main review 는 그대로 진행해 운영 가용성 보장.
+            if self._follow_up_use_case is not None and job.action in _FOLLOWUP_ACTIONS:
+                try:
+                    await self._follow_up_use_case.execute(pr)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    dlog.exception(
+                        "follow-up failed for %s#%d (continuing with main review)",
+                        job.repo.full_name,
+                        job.number,
+                    )
+
+            await self._use_case.execute(pr)
+            dlog.info("done %s#%d", job.repo.full_name, job.number)
+        except PullRequestNotReviewableError as exc:
+            dlog.warning(
+                "skipping non-reviewable PR %s#%d: %s",
+                job.repo.full_name,
+                job.number,
+                exc,
+            )
+            try:
+                await self._github.post_comment(
+                    _comment_only_pr(job),
+                    _not_reviewable_message(str(exc)),
+                )
+            except Exception:
+                dlog.exception(
+                    "failed to post non-reviewable notice for %s#%d",
+                    job.repo.full_name,
+                    job.number,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            dlog.exception("review failed for %s#%d", job.repo.full_name, job.number)
+
+
+def _comment_only_pr(job: WebhookJob) -> PullRequest:
+    return PullRequest(
+        repo=job.repo,
+        number=job.number,
+        title="",
+        body="",
+        head_sha="",
+        head_ref="",
+        base_sha="",
+        base_ref="",
+        clone_url="",
+        changed_files=(),
+        installation_id=job.installation_id,
+        is_draft=False,
+        diff_right_lines={},
+        diff_patches={},
+    )
+
+
+def _not_reviewable_message(reason: str) -> str:
+    return (
+        "⚠️ **Ox Alpha Review — 리뷰 건너뜀**\n\n"
+        "이 PR 은 자동 리뷰용 체크아웃 정보를 안전하게 확인할 수 없어 건너뛰었습니다.\n\n"
+        f"- 사유: `{reason}`\n\n"
+        "삭제된 fork 또는 접근 불가한 head 저장소에서 발생할 수 있습니다."
+    )
