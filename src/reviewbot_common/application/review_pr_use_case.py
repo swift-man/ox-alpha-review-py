@@ -1,0 +1,891 @@
+import asyncio
+import hashlib
+import logging
+import re
+from collections.abc import Mapping
+from dataclasses import replace
+
+from reviewbot_common.domain import (
+    DUMP_MODE_DIFF,
+    FileDump,
+    Finding,
+    MetaReply,
+    PullRequest,
+    ReviewComment,
+    ReviewHistory,
+    ReviewResult,
+    TokenBudget,
+)
+from reviewbot_common.domain.model_limit import is_model_limit_error
+from reviewbot_common.interfaces import (
+    DiffContextCollector,
+    FileCollector,
+    GitHubClient,
+    RepoFetcher,
+    ReviewEngine,
+    ReviewEngineError,
+)
+from reviewbot_common.logging_utils import redact_text
+
+logger = logging.getLogger(__name__)
+
+
+class ReviewPullRequestUseCase:
+    """Orchestrates: fetch PR → checkout → collect files → review → post.
+
+    전체-코드베이스 리뷰가 예산 초과로 성립하지 않을 때, diff-only 모드로 **자동
+    fallback** 하여 unified patch 만 가지고 리뷰를 게시한다. diff 조차 예산을 넘으면
+    그때서야 리뷰를 포기하고 안내 코멘트만 남긴다.
+    """
+
+    def __init__(
+        self,
+        github: GitHubClient,
+        repo_fetcher: RepoFetcher,
+        file_collector: FileCollector,
+        engine: ReviewEngine,
+        max_input_tokens: int,
+        diff_context_collector: DiffContextCollector | None = None,
+        bot_login: str | None = None,
+        engine_label: str = "Review Bot",
+        max_input_tokens_env: str = "MAX_INPUT_TOKENS",
+        model_env: str = "MODEL",
+        enable_diff_fallback_env: str = "ENABLE_DIFF_FALLBACK",
+    ) -> None:
+        self._github = github
+        self._repo_fetcher = repo_fetcher
+        self._file_collector = file_collector
+        self._engine = engine
+        self._budget = TokenBudget(max_tokens=max_input_tokens)
+        # None 이면 fallback 을 비활성화한다 (기존 동작: 예산 초과 시 리뷰 스킵).
+        # 운영자가 명시적으로 옵트인 할 수 있도록 DI 경계에서 결정.
+        self._diff_collector = diff_context_collector
+        # 우리 봇 자신의 GitHub login (예: `codex-review-bot[bot]`). 메타리플라이
+        # allowlist 의 self-exclusion 과 model-limit notice 멱등성 검사에 사용.
+        # None 이면 작성자 신뢰 판정을 할 수 없으므로 보안상 limit notice 억제도 비활성화
+        # — 운영자가 GITHUB_APP_SLUG 를 설정해야만 활성화.
+        self._bot_login = bot_login
+        if bot_login is None:
+            logger.warning(
+                "model limit notice dedupe disabled because bot_login is not configured "
+                "(set GITHUB_APP_SLUG to enable trusted marker checks)"
+            )
+        self._engine_label = engine_label
+        self._max_input_tokens_env = max_input_tokens_env
+        self._model_env = model_env
+        self._enable_diff_fallback_env = enable_diff_fallback_env
+
+    async def execute(self, pr: PullRequest) -> None:
+        token = await self._github.get_installation_token(pr.installation_id)
+
+        # 이전 라운드의 PR 코멘트 / 다른 봇 의견을 history 로 가져와 prompt 컨텍스트에
+        # 노출 — 모델이 동일 항목 반복 지적, deferred 신호 무시, 다른 봇 환각 미식별을
+        # 피하도록 한다.
+        #
+        # 부분 실패 처리는 인프라 계층에서 자체 수행 (gemini PR #24 Critical+Major+DIP
+        # 후속 라운드): `GitHubAppClient.fetch_review_history` 가 3개 엔드포인트를
+        # `gather(return_exceptions=True)` 로 호출해 한 엔드포인트 일시 장애 시 나머지
+        # 정상 데이터로 history 를 채우고, 모두 실패해도 빈 ReviewHistory 를 반환한다.
+        # 따라서 use case 는 httpx 등 인프라 라이브러리 예외를 직접 catch 할 필요가 없다 —
+        # 계층 간 의존성 깨끗하게 유지 (DIP).
+        history = await self._github.fetch_review_history(pr, pr.installation_id)
+        if _has_model_limit_notice_for_current_state(
+            pr,
+            history,
+            bot_login=self._bot_login,
+        ):
+            logger.info(
+                "skipping review for %s#%d — model limit notice already posted for head %s",
+                pr.repo.full_name,
+                pr.number,
+                pr.head_sha,
+            )
+            return
+
+        # 저장소 락 범위를 checkout ~ 파일 수집 전체로 확대한다. 이전 구현은 `checkout()`
+        # 리턴과 동시에 락이 풀려, 같은 저장소의 다른 PR 이 head SHA 를 바꾸는 동안
+        # 이 쪽 collect 가 파일을 읽어 "다른 PR 의 트리" 를 수집하는 경쟁이 있었다.
+        async with self._repo_fetcher.session(pr, token) as repo_path:
+            dump = await self._file_collector.collect(repo_path, pr.changed_files, self._budget)
+
+        # 이 지점 이후 파일 I/O 없음 — dump 는 메모리에 담긴 스냅샷. 락을 풀어도 안전.
+        review_pr = _filter_pr_to_reviewable_changes(pr, dump)
+        if not review_pr.changed_files:
+            logger.info(
+                "skipping review for %s#%d — all changed files were excluded by policy",
+                pr.repo.full_name,
+                pr.number,
+            )
+            return
+        history = _filter_history_to_reviewable_paths(
+            history,
+            frozenset(dump.filter_excluded),
+        )
+
+        # ── 1차 fallback: PRE-EMPTIVE (사전 예산 계산 기반) ────────────────
+        # 변경 파일이 **예산 때문에** 잘려 나갔다면 전체-코드베이스 리뷰가 성립하지 않는다.
+        # 단 바이너리/정책 필터로 제외된 변경 파일(예: .png) 은 fallback 을 트리거하면 안 된다
+        # — 의미상 "diff 에서 봐도 못 보는 파일" 이라 fallback 해봐야 품질만 떨어진다.
+        if dump.exceeded_budget and _changed_trimmed_by_budget(review_pr, dump):
+            fallback_dump = await self._try_diff_fallback(review_pr, history=history)
+            if fallback_dump is None:
+                logger.warning(
+                    "budget exceeded for %s#%d — skipping review, posting notice",
+                    review_pr.repo.full_name,
+                    review_pr.number,
+                )
+                if await self._is_pr_head_current_before_post(review_pr, "budget notice"):
+                    await self._github.post_comment(
+                        review_pr,
+                        _budget_exceeded_message(
+                            review_pr,
+                            dump,
+                            engine_label=self._engine_label,
+                            max_input_tokens_env=self._max_input_tokens_env,
+                        ),
+                    )
+                return
+            dump = fallback_dump
+
+        logger.info(
+            "reviewing %s#%d — mode=%s files=%d chars=%d excluded=%d",
+            review_pr.repo.full_name,
+            review_pr.number,
+            dump.mode,
+            len(dump.entries),
+            dump.total_chars,
+            len(dump.excluded),
+        )
+
+        # ── 2차 fallback: REACTIVE (엔진 실패 기반) ───────────────────────
+        # 우리 예산 추정(`max_tokens x 4 chars`)은 모델의 실제 토큰 한도와 다를 수 있다.
+        # 특히 한글 등 멀티바이트 코드베이스에서는 우리가 "fit" 으로 판정해도 모델이 입력
+        # 거부 → CLI 가 returncode 1 로 실패. 이때 봇이 그대로 죽으면 PR 에 아무
+        # 메시지도 안 달려 운영 가시성이 크게 떨어진다. 따라서 **full 모드에서 엔진이
+        # 실패하면 자동으로 diff 모드로 재시도** 해 가용성을 보장한다.
+        # `entered_diff_preemptively` 플래그는 _review_with_fallback 으로 전달되는 진입
+        # 사유 — diff 배지 문구를 "예산 초과" vs "엔진 거부 후 재시도" 로 분기시키는 근거.
+        entered_diff_preemptively = dump.mode == DUMP_MODE_DIFF
+        result = await self._review_with_fallback(
+            review_pr,
+            dump,
+            entered_diff_preemptively=entered_diff_preemptively,
+            history=history,
+        )
+        if result is None:
+            return  # 진단 코멘트 게시 후 정리 종료
+
+        # 모델이 제안한 인라인 코멘트를 PR diff 의 RIGHT-side 라인 집합과 교차해 걸러낸다.
+        # (변경되지 않은 파일/줄에 코멘트를 달면 GitHub 가 422 로 리뷰 전체를 거부한다.)
+        # 걸러진 항목은 본문 렌더링에도 반영되도록 ReviewResult 자체를 새로 만든다.
+        result = _filter_findings_to_diff(
+            result,
+            review_pr.diff_right_lines,
+            review_pr.repo.full_name,
+            review_pr.number,
+        )
+
+        if not await self._is_pr_head_current_before_post(review_pr, "review"):
+            return
+        await self._github.post_review(review_pr, result)
+
+        # 메타리플라이는 review post 성공 후 별도 단계로 게시. review post 가 실패했으면
+        # meta-reply 의 의미 자체가 사라지므로 진행 안 함. 한 건이라도 실패해도 서로
+        # 영향 없도록 `gather(return_exceptions=True)` (현재는 ≤1건이라 실질적으로 단일).
+        if result.meta_replies:
+            await self._post_meta_replies(review_pr, result, history)
+
+    async def _post_meta_replies(
+        self,
+        pr: PullRequest,
+        result: ReviewResult,
+        history: ReviewHistory,
+    ) -> None:
+        """모델이 산출한 메타리플라이를 다른 봇 inline review comment 의 thread 에 게시.
+
+        보안 검증 (codex PR #24 Major): 모델이 반환한 `reply_to_comment_id` 가 이번
+        라운드 history 의 inline comment id 집합에 속하는지 화이트리스트 검증한다.
+        prompt 안의 사용자 작성 텍스트나 모델 환각으로 임의 ID 가 섞여 들어와 엉뚱한
+        thread 에 봇 대댓글이 달리는 경로를 차단. 화이트리스트 외 ID 는 drop + 경고.
+
+        파서 단에서 이미 `_META_REPLY_MAX=1` 로 제한되지만 방어적으로 try/except 로 묶어
+        한 건 실패가 use case 흐름 (이미 review 게시 완료) 을 망치지 않게 한다.
+        """
+        # history 의 inline 코멘트 id 집합 — 단 **다른 봇 작성** 코멘트만 허용:
+        #   - bot suffix `[bot]` (사람 로그인 차단 — coderabbit PR #24 Major)
+        #   - 우리 봇 자신 제외 (codex / gemini PR #24 후속 라운드 Major):
+        #     allowlist 가 자기 봇도 허용하면 자기 답글에 자기 답글 다는 무한 루프 가능.
+        #
+        # 자기 봇 식별이 불가능하면 (`_bot_login is None`) 메타리플라이 자체를 비활성화
+        # — `GITHUB_APP_SLUG` 미설정 운영 환경에서 우리가 자기 댓글을 골라도 막을 방법이
+        # 없기 때문에 안전 우선 정책 (codex PR #24 후속 라운드 Major). `casefold()` 비교
+        # 로 author_login 대소문자 차이로 우회되는 엣지 케이스 방어 (gemini Minor).
+        # issue / review-summary 는 thread 자체가 없어 원천 제외.
+        if self._bot_login is None:
+            allowed_ids: set[int] = set()
+        else:
+            self_login_cf = self._bot_login.casefold()
+            allowed_ids = {
+                c.comment_id
+                for c in history.comments
+                if c.kind == "inline"
+                and c.comment_id is not None
+                and not c.is_reply  # 루트 inline 만 — 대댓글에 또 답글 차단 (codex PR #24)
+                and c.author_login.endswith("[bot]")
+                and c.author_login.casefold() != self_login_cf
+            }
+        validated: list[MetaReply] = []
+        for m in result.meta_replies:
+            if m.reply_to_comment_id not in allowed_ids:
+                logger.warning(
+                    "meta_reply target comment_id=%d not in history allowlist "
+                    "(prompt-injection or hallucination?) — dropping on %s#%d",
+                    m.reply_to_comment_id,
+                    pr.repo.full_name,
+                    pr.number,
+                )
+                continue
+            validated.append(m)
+        if not validated:
+            return
+
+        results = await asyncio.gather(
+            *(
+                self._github.reply_to_review_comment(pr, m.reply_to_comment_id, m.body)
+                for m in validated
+            ),
+            return_exceptions=True,
+        )
+        for reply, outcome in zip(validated, results, strict=True):
+            if isinstance(outcome, BaseException):
+                logger.warning(
+                    "meta_reply post failed: comment_id=%d on %s#%d",
+                    reply.reply_to_comment_id,
+                    pr.repo.full_name,
+                    pr.number,
+                    exc_info=outcome,
+                )
+
+    async def _review_with_fallback(
+        self,
+        pr: PullRequest,
+        dump: FileDump,
+        *,
+        entered_diff_preemptively: bool,
+        history: ReviewHistory | None = None,
+    ) -> ReviewResult | None:
+        """엔진 호출을 시도하고, full 모드 실패 시 diff 모드로 재시도. 둘 다 실패하면
+        PR 에 진단 코멘트를 게시하고 None 반환 — 호출자가 종료하도록 한다.
+
+        `entered_diff_preemptively` 는 호출자에서 결정해 넘긴다 — 이 함수 내부의
+        `dump.mode == DUMP_MODE_DIFF` 만으로는 "사전 예산 fallback 진입" 인지
+        "full 실패 후 diff 재시도" 인지 구분할 수 없기 때문 (양쪽 모두 dump 가
+        diff 모드로 끝남). 배지 문구를 시나리오별로 정확히 렌더링하기 위한 단서.
+
+        반환값:
+          - 성공한 `ReviewResult` (full 또는 diff 모드, 배지 prepend 포함)
+          - 모든 시도 실패 시 None (이미 진단 코멘트 게시 완료)
+        """
+        # diff-only 배지의 "전환 사유" 문구 분기 근거. full 실패 후 diff 재시도 성공
+        # 시 reactive 로 갱신되어, 운영자/리뷰어에게 "예산 초과가 아니라 엔진이 full
+        # 입력을 거부해서 diff 로 떨어진 것" 임을 정확히 전달 (codex PR #18 Major).
+        scope_reason = (
+            _SCOPE_PREEMPTIVE_BUDGET if entered_diff_preemptively else _SCOPE_REACTIVE_ENGINE_REJECT
+        )
+        try:
+            result = await self._engine.review(pr, dump, history=history)
+        except ReviewEngineError as exc:
+            if not exc.allow_diff_fallback:
+                logger.error(
+                    "non-retryable engine failure for %s#%d — diff fallback disabled",
+                    pr.repo.full_name,
+                    pr.number,
+                )
+                await self._post_engine_failure_comment(
+                    pr,
+                    dump,
+                    exc,
+                    failure_mode=(
+                        _FAILURE_DIFF_PREEMPTIVE
+                        if entered_diff_preemptively
+                        else _FAILURE_FULL_ONLY
+                    ),
+                    history=history,
+                )
+                return None
+            # 이미 diff 모드 dump 로 들어와 실패한 경우 → 사전(preemptive) 예산 fallback
+            # 으로 진입했다는 의미. full 시도는 일어나지 않았다 (codex PR #18 Minor 반영:
+            # 이전 boolean `attempted_diff=True` 표현은 "full→diff 재시도" 로 오해 소지).
+            if entered_diff_preemptively:
+                logger.exception(
+                    "engine failed in preemptive diff-only mode for %s#%d — no further fallback",
+                    pr.repo.full_name,
+                    pr.number,
+                )
+                await self._post_engine_failure_comment(
+                    pr,
+                    dump,
+                    exc,
+                    failure_mode=_FAILURE_DIFF_PREEMPTIVE,
+                    history=history,
+                )
+                return None
+
+            # full 모드 실패 — 모델이 입력 거부했을 가능성 높다. diff 모드로 재시도.
+            # 예외 타입은 항상 ReviewEngineError 라 type(exc).__name__ 은 정보가 없어
+            # 마스킹된 메시지(str(exc)) 를 직접 노출 (gemini PR #18 Minor 반영).
+            logger.warning(
+                "engine failed on full mode for %s#%d — retrying in diff-only mode (cause: %s)",
+                pr.repo.full_name,
+                pr.number,
+                str(exc),
+            )
+            fallback_dump = await self._try_diff_fallback(pr, history=history)
+            if fallback_dump is None:
+                # diff fallback 자체가 불가 — patch 없거나 운영자가 옵트아웃.
+                logger.exception(
+                    "engine failed and diff fallback unavailable for %s#%d",
+                    pr.repo.full_name,
+                    pr.number,
+                )
+                await self._post_engine_failure_comment(
+                    pr,
+                    dump,
+                    exc,
+                    failure_mode=_FAILURE_FULL_ONLY,
+                    history=history,
+                )
+                return None
+            try:
+                result = await self._engine.review(pr, fallback_dump, history=history)
+            except ReviewEngineError as retry_exc:
+                logger.exception(
+                    "engine retry in diff mode also failed for %s#%d",
+                    pr.repo.full_name,
+                    pr.number,
+                )
+                await self._post_engine_failure_comment(
+                    pr,
+                    fallback_dump,
+                    retry_exc,
+                    failure_mode=_FAILURE_FULL_THEN_DIFF,
+                    history=history,
+                )
+                return None
+            dump = fallback_dump  # 이후 배지 결정 용
+
+        # diff-only 모드로 수행된 리뷰는 본문 상단에 배지를 달아, 리뷰어가 "왜 전체
+        # 코드베이스 지적이 얕은지" 를 바로 인지하도록 한다. `scope_reason` 은
+        # 위에서 결정 — full 실패 후 diff 재시도 성공 경로는 reactive 로 표기.
+        if dump.mode == DUMP_MODE_DIFF:
+            result = _prepend_diff_scope_badge(
+                result,
+                dump,
+                scope_reason,
+                max_input_tokens_env=self._max_input_tokens_env,
+            )
+        return result
+
+    async def _try_diff_fallback(
+        self,
+        pr: PullRequest,
+        *,
+        history: ReviewHistory | None = None,
+    ) -> FileDump | None:
+        """diff-only 모드로 fallback 가능 여부를 판단해 성공 시 새 dump 를 반환."""
+        if self._diff_collector is None:
+            # 운영자가 fallback 을 끈 상태 — 기존 "포기" 경로 유지.
+            return None
+        if not pr.diff_patches:
+            # GitHub 가 patch 를 단 한 건도 돌려주지 않음 (초거대 PR / binary-only 등).
+            # diff 모드로도 볼 게 없으므로 fallback 의미가 없다.
+            logger.warning(
+                "diff fallback unavailable: no patches present for %s#%d",
+                pr.repo.full_name,
+                pr.number,
+            )
+            return None
+        diff_dump = await self._diff_collector.collect_diff(
+            pr,
+            self._budget,
+            history=history,
+        )
+        if not diff_dump.entries:
+            # 전부 patch_missing 이거나 예산 초과로 하나도 못 담았음 — 의미 없는 리뷰 방지.
+            # 두 카테고리(patch 누락 vs 예산 컷) 를 함께 노출해 운영자가 원인을 정확히
+            # 추적할 수 있게 한다 (gemini PR #18 Minor 반영).
+            logger.warning(
+                "diff fallback produced empty dump for %s#%d (patch_missing=%d, budget_trimmed=%d)",
+                pr.repo.full_name,
+                pr.number,
+                len(diff_dump.patch_missing),
+                len(diff_dump.budget_trimmed),
+            )
+            return None
+        if diff_dump.exceeded_budget:
+            logger.info(
+                "diff fallback partial for %s#%d — %d files truncated by budget",
+                pr.repo.full_name,
+                pr.number,
+                len(diff_dump.budget_trimmed),
+            )
+        logger.info(
+            "falling back to diff-only review for %s#%d — files=%d chars=%d",
+            pr.repo.full_name,
+            pr.number,
+            len(diff_dump.entries),
+            diff_dump.total_chars,
+        )
+        return diff_dump
+
+    async def _post_engine_failure_comment(
+        self,
+        pr: PullRequest,
+        dump: FileDump,
+        exc: BaseException,
+        *,
+        failure_mode: str,
+        history: ReviewHistory | None,
+    ) -> None:
+        if _is_model_limit_error(exc) and history is not None:
+            has_non_limit_failure = _has_non_limit_failure_message(exc)
+            current_notice = _latest_model_limit_notice_for_current_state(
+                pr,
+                history,
+                bot_login=self._bot_login,
+            )
+            if current_notice is not None and (
+                not has_non_limit_failure or _has_failure_cause(current_notice)
+            ):
+                logger.info(
+                    "suppressing duplicate model limit notice for %s#%d at head %s",
+                    pr.repo.full_name,
+                    pr.number,
+                    pr.head_sha,
+                )
+                return
+            if not has_non_limit_failure and _has_active_model_limit_notice_for_pr(
+                history,
+                bot_login=self._bot_login,
+            ):
+                logger.info(
+                    "suppressing repeated model limit notice for %s#%d at head %s "
+                    "because an active PR-level limit notice already exists",
+                    pr.repo.full_name,
+                    pr.number,
+                    pr.head_sha,
+                )
+                return
+
+        if not await self._is_pr_head_current_before_post(pr, "engine failure comment"):
+            return
+
+        body = _engine_failure_message(
+            pr,
+            dump,
+            exc,
+            failure_mode=failure_mode,
+            engine_label=self._engine_label,
+            max_input_tokens_env=self._max_input_tokens_env,
+            model_env=self._model_env,
+            enable_diff_fallback_env=self._enable_diff_fallback_env,
+        )
+        if _is_model_limit_error(exc):
+            body = f"{body}\n\n{_model_limit_notice_marker(pr)}"
+        await self._github.post_comment(pr, body)
+
+    async def _is_pr_head_current_before_post(self, pr: PullRequest, kind: str) -> bool:
+        current_head = await self._github.fetch_pull_request_head_sha(pr)
+        if current_head.strip().casefold() == pr.head_sha.strip().casefold():
+            return True
+        logger.info(
+            "skipping %s for %s#%d because PR head changed during review (reviewed=%s current=%s)",
+            kind,
+            pr.repo.full_name,
+            pr.number,
+            pr.head_sha,
+            current_head,
+        )
+        return False
+
+
+def _changed_trimmed_by_budget(pr: PullRequest, dump: FileDump) -> bool:
+    """변경 파일 중 **예산 초과로** 덤프에서 빠진 파일이 있는지.
+
+    이전 `_changed_missing` 은 정책(바이너리/크기) 으로 제외된 파일까지 "누락" 으로
+    판정해 불필요한 diff fallback 을 유발했다. `dump.budget_trimmed` 는 이제 정확히
+    예산 컷 집합만 담으므로 여기서 교차 검사만 하면 된다 (gemini 리뷰 Major 반영).
+
+    `set.isdisjoint` 가 `any(... in set ...)` 보다 C 레벨 최적화로 더 빠르다 — 큰
+    PR 에서 micro perf 이긴 하지만 표현이 깔끔 (gemini PR #18 Suggestion).
+    """
+    budget_cut = set(dump.budget_trimmed)
+    if not budget_cut:
+        return False
+    return not budget_cut.isdisjoint(pr.changed_files)
+
+
+def _filter_pr_to_reviewable_changes(pr: PullRequest, dump: FileDump) -> PullRequest:
+    """Remove changed paths that the file collector excluded by policy.
+
+    The prompt should not list README/assets/lock files as changed when the repo policy says
+    they are out of scope. Keeping only reviewable changed files also makes diff fallback use
+    the same scope as full mode.
+    """
+    policy_excluded = set(dump.filter_excluded)
+    if not policy_excluded:
+        return pr
+
+    changed_files = tuple(p for p in pr.changed_files if p not in policy_excluded)
+    if changed_files == pr.changed_files:
+        return pr
+
+    changed_set = set(changed_files)
+    return replace(
+        pr,
+        changed_files=changed_files,
+        diff_right_lines={
+            path: lines for path, lines in pr.diff_right_lines.items() if path in changed_set
+        },
+        diff_patches={
+            path: patch for path, patch in pr.diff_patches.items() if path in changed_set
+        },
+    )
+
+
+def _filter_history_to_reviewable_paths(
+    history: ReviewHistory,
+    policy_excluded: frozenset[str],
+) -> ReviewHistory:
+    if history.is_empty or not policy_excluded:
+        return history
+
+    comments = tuple(
+        comment
+        for comment in history.comments
+        if comment.kind != "inline" or comment.path not in policy_excluded
+    )
+    if len(comments) == len(history.comments):
+        return history
+    return replace(history, comments=comments)
+
+
+def _filter_findings_to_diff(
+    result: ReviewResult,
+    diff_right_lines: Mapping[str, frozenset[int]],
+    repo_full_name: str,
+    pr_number: int,
+) -> ReviewResult:
+    """Drop findings whose (path, line) is not in the PR's RIGHT-side diff.
+
+    diff 정보가 비어 있으면(fetch 실패나 테스트 더블) 보수적으로 전부 드롭한다.
+    드롭 건수는 로그로 남기고, **드롭된 finding 은 `dropped_findings` 에 누적해 리뷰
+    본문에서 접이식 섹션으로 보존** 한다 (codex/gemini PR #17 지적 반영).
+    이렇게 하지 않으면 라인 번호가 어긋난 순간 지적 자체가 조용히 사라져 리뷰 품질
+    을 과대평가할 위험이 있다.
+    """
+    if not result.findings:
+        return result
+
+    kept: list[Finding] = []
+    dropped: list[Finding] = []
+    for f in result.findings:
+        allowed = diff_right_lines.get(f.path)
+        if allowed is not None and f.line in allowed:
+            kept.append(f)
+        else:
+            dropped.append(f)
+
+    if dropped:
+        logger.info(
+            "%s#%d — dropped %d/%d inline finding(s) not on RIGHT-side diff "
+            "(preserved in body as collapsible section)",
+            repo_full_name,
+            pr_number,
+            len(dropped),
+            len(result.findings),
+        )
+        return replace(
+            result,
+            findings=tuple(kept),
+            # 이전 단계에서 이미 dropped 된 항목(예: 422 재시도) 과 누적해야 한다.
+            dropped_findings=result.dropped_findings + tuple(dropped),
+        )
+    return result
+
+
+# diff-only 모드로 진입한 사유 분류 — 배지 문구를 시나리오별로 분리하기 위함.
+# 이전 구현은 사유를 항상 "예산 초과" 로 단정해, full 모드에서 엔진 거부 후 diff 로
+# 떨어진 reactive 케이스에서 운영자에게 잘못된 원인을 전달했다 (codex PR #18 Major).
+_SCOPE_PREEMPTIVE_BUDGET = "preemptive_budget"
+_SCOPE_REACTIVE_ENGINE_REJECT = "reactive_engine_reject"
+
+
+def _prepend_diff_scope_badge(
+    result: ReviewResult,
+    dump: FileDump,
+    scope_reason: str,
+    *,
+    max_input_tokens_env: str,
+) -> ReviewResult:
+    """diff-only 모드 리뷰임을 알리는 안내를 summary 최상단에 붙인다.
+
+    `summary` 에 주입하는 이유: `ReviewResult.render_body()` 가 `summary` 를 본문
+    최상단에 렌더링하므로, 리뷰어가 제목 바로 밑에서 배지를 보게 된다. 별도 필드를
+    추가해 도메인 모델을 오염시키는 것보다 간단하고 가시성이 동일.
+
+    `scope_reason` 은 `_SCOPE_*` 상수 — 사전 예산 fallback 인지, full 실패 후 diff
+    재시도인지에 따라 사유 문구를 다르게 렌더링한다 (codex PR #18 Major 반영).
+    """
+    if scope_reason == _SCOPE_REACTIVE_ENGINE_REJECT:
+        # full 입력은 우리 예산 안에 들어왔지만 모델/CLI 가 거부 → diff 재시도 성공.
+        # "예산 초과" 라고 안내하면 운영자가 입력 예산만 만지작거리며
+        # 시간 낭비한다. 실제 원인 후보(모델 미지원·인증·CLI 오류·타임아웃) 를
+        # 명시해 서버 로그를 보러 가도록 유도.
+        reason_text = (
+            "> 전체 코드베이스 입력은 예산 안에 들어왔으나 리뷰 엔진이 입력을 거부하여 "
+            "diff-only 모드로 자동 재시도했습니다 "
+            "(원인 후보: 모델 컨텍스트 한도 / 모델 미지원 / 인증 / CLI 오류 / 타임아웃 — "
+            "서버 stderr 로그를 확인하세요)."
+        )
+    else:
+        # 기본: 사전 예산 fallback. 전체 코드베이스 합산이 우리 추정 예산을 넘었다.
+        reason_text = (
+            f"> 전체 코드베이스가 입력 예산(`{max_input_tokens_env}`) 을 초과하여 "
+            "PR 의 unified patch 만 근거로 리뷰했습니다."
+        )
+    lines = [
+        "> ⚠️ **리뷰 범위: diff-only (자동 전환)**",
+        reason_text,
+        f"> 포함된 diff 파일 {len(dump.entries)}건, "
+        f"예산 초과로 제외 {len(dump.budget_trimmed)}건, "
+        f"patch 누락 {len(dump.patch_missing)}건.",
+        "",
+    ]
+    return replace(result, summary="\n".join(lines) + result.summary)
+
+
+def _make_code_fence_safe(text: str) -> str:
+    """입력 안의 ``` 시퀀스를 zero-width-space 로 분리해 markdown 코드펜스 깨짐 방어.
+
+    PR 진단 코멘트는 detail 을 ``` … ``` 코드펜스에 감싸 게시하는데, detail 자체에
+    ``` 가 있으면 GitHub 마크다운이 fence 를 그 위치에서 닫아 본문 나머지가 깨진다.
+    각 백틱 사이에 U+200B(zero-width space) 를 끼워 시각적으로는 거의 같지만 fence
+    파서엔 더 이상 ``` 로 인식되지 않게 만든다.
+    """
+    return text.replace("```", "`\u200b`\u200b`")
+
+
+# 엔진 실패 시도 경로 분류 — 진단 코멘트가 운영자에게 어떤 시도가 있었는지 정확히
+# 보여주기 위함. boolean (`attempted_diff`) 으로는 "사전 fallback 으로 diff 진입 후
+# 실패" 와 "full 후 diff 재시도까지 실패" 를 구분 못 했음 (codex PR #18 Minor).
+_FAILURE_FULL_ONLY = "full_only"  # full 시도, diff fallback 불가
+_FAILURE_FULL_THEN_DIFF = "full_then_diff"  # full 실패 → diff 재시도까지 실패
+_FAILURE_DIFF_PREEMPTIVE = "diff_preemptive"  # 사전 예산 fallback 으로 diff, 거기서 실패
+
+_FAILURE_MODE_DESCRIPTIONS = {
+    _FAILURE_FULL_ONLY: "full 모드 시도 (diff-only fallback 사용 불가 — patch 부재 또는 옵트아웃)",
+    _FAILURE_FULL_THEN_DIFF: "full 모드 실패 → diff-only 모드 재시도까지 실패",
+    _FAILURE_DIFF_PREEMPTIVE: "사전 예산 fallback 으로 diff-only 모드에서 시도 (full 모드 미시도)",
+}
+
+_MODEL_LIMIT_NOTICE_MARKER_PREFIX = "<!-- reviewbot:model-limit-notice"
+_GIT_COMMIT_SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)
+
+
+def _model_limit_notice_marker(pr: PullRequest) -> str:
+    return f"{_MODEL_LIMIT_NOTICE_MARKER_PREFIX} head={_marker_head_id(pr.head_sha)} -->"
+
+
+def _marker_head_id(head_sha: str) -> str:
+    head = head_sha.strip()
+    if _GIT_COMMIT_SHA_PATTERN.fullmatch(head):
+        return head.casefold()
+    digest = hashlib.sha256(head.encode("utf-8")).hexdigest()[:16]
+    return f"sha256-{digest}"
+
+
+def _has_model_limit_notice_for_current_state(
+    pr: PullRequest,
+    history: ReviewHistory,
+    *,
+    bot_login: str | None,
+) -> bool:
+    return (
+        _latest_model_limit_notice_for_current_state(pr, history, bot_login=bot_login) is not None
+    )
+
+
+def _latest_model_limit_notice_for_current_state(
+    pr: PullRequest,
+    history: ReviewHistory,
+    *,
+    bot_login: str | None,
+) -> ReviewComment | None:
+    if bot_login is None:
+        return None
+
+    notice = _latest_model_limit_notice_for_bot(history, bot_login=bot_login)
+    if notice is None or _model_limit_notice_marker(pr) not in notice.body:
+        return None
+    return notice
+
+
+def _has_active_model_limit_notice_for_pr(
+    history: ReviewHistory,
+    *,
+    bot_login: str | None,
+) -> bool:
+    return _latest_model_limit_notice_for_bot(history, bot_login=bot_login) is not None
+
+
+def _latest_model_limit_notice_for_bot(
+    history: ReviewHistory,
+    *,
+    bot_login: str | None,
+) -> ReviewComment | None:
+    if bot_login is None:
+        return None
+
+    bot_login_cf = bot_login.casefold()
+    for comment in reversed(history.comments):
+        if comment.author_login.casefold() != bot_login_cf:
+            continue
+        if comment.kind == "issue":
+            if _MODEL_LIMIT_NOTICE_MARKER_PREFIX in comment.body:
+                return comment
+            return None
+        if comment.kind in ("inline", "review-summary"):
+            return None
+    return None
+
+
+def _is_model_limit_error(exc: BaseException) -> bool:
+    if isinstance(exc, ReviewEngineError) and exc.limit_details:
+        return True
+    return is_model_limit_error(exc)
+
+
+def _has_non_limit_failure_message(exc: BaseException) -> bool:
+    return isinstance(exc, ReviewEngineError) and bool(exc.non_limit_failure_message)
+
+
+def _has_failure_cause(comment: ReviewComment) -> bool:
+    return "실패 원인" in comment.body
+
+
+def _engine_failure_message(
+    pr: PullRequest,
+    dump: FileDump,
+    exc: BaseException,
+    *,
+    failure_mode: str,
+    engine_label: str,
+    max_input_tokens_env: str,
+    model_env: str,
+    enable_diff_fallback_env: str,
+) -> str:
+    """엔진 호출이 모두 실패했을 때 PR 에 게시할 진단 코멘트.
+
+    `failure_mode` 는 `_FAILURE_*` 상수 중 하나로, 운영자가 어떤 시도가 있었는지
+    정확히 인지할 수 있도록 한다 (이전 boolean `attempted_diff` 표현은
+    "사전 diff 실패" 와 "full→diff 실패" 를 구분 못 했음 — codex PR #18 Minor).
+
+    보안 고려:
+      - `str(exc)` 는 stderr 마지막 줄을 포함할 수 있어 토큰 URL / 인증 헤더가
+        섞일 위험이 있다. 엔진 단에서 마스킹했더라도 다른 ReviewEngine 구현에서
+        새 누출 표면이 생길 수 있으므로 **본문 게시 직전 한 번 더 redact_text**
+        를 적용 (defense-in-depth, codex PR #18 Critical+Major 반영).
+      - 코드펜스 안에 백틱 3개가 들어 있으면 ``` 가 풀려 본문 전체 markdown 이
+        깨진다. detail 의 백틱을 zero-width-space 로 분리해 fence 깨짐 방어
+        (codex PR #18 Suggestion 반영).
+    """
+    limit_details = _model_limit_details_message(exc)
+    failure_cause = _failure_cause_message(exc, has_limit_details=bool(limit_details))
+
+    mode_desc = _FAILURE_MODE_DESCRIPTIONS.get(failure_mode, failure_mode)
+    advice = (
+        f"1. `{max_input_tokens_env}` 를 모델 실제 윈도우보다 작게 조정 "
+        "(예: 150000) → 큰 PR 은 자동 diff 모드로 떨어집니다.\n"
+        f"2. 더 큰 컨텍스트 윈도우의 모델로 `{model_env}` 변경.\n"
+        "3. 서버 로그(stderr 전체) 를 확인해 모델/CLI 측 메시지 검증.\n"
+    )
+    if failure_mode == _FAILURE_FULL_ONLY:
+        advice += (
+            f"4. `{enable_diff_fallback_env}=true` 확인 또는 GitHub 가 patch 를 반환했는지 "
+            "확인 (큰 PR / binary 변경만으로 구성된 경우 patch 누락 가능).\n"
+        )
+
+    return (
+        f"⚠️ **{engine_label} — 리뷰 엔진 실패**\n\n"
+        f"이 PR 은 자동 리뷰를 완료하지 못했습니다 ({mode_desc}).\n\n"
+        f"- 마지막 시도 모드: `{dump.mode}`\n"
+        f"- 컨텍스트 파일 수: {len(dump.entries)}\n"
+        f"{failure_cause}"
+        f"{limit_details}"
+        "**조치 제안**\n"
+        f"{advice}"
+    )
+
+
+def _model_limit_details_message(exc: BaseException) -> str:
+    details = getattr(exc, "limit_details", ())
+    if not details:
+        return ""
+
+    lines = ["**모델 한도 해제 정보**"]
+    for detail in details:
+        model_label = _code_span(redact_text(str(detail.model_label)))
+        reset_hint = detail.reset_hint or "에러 메시지에서 확인 불가"
+        reset_hint = _code_span(redact_text(reset_hint))
+        lines.append(f"- {model_label}: {reset_hint}")
+    return "\n".join(lines) + "\n\n"
+
+
+def _failure_cause_message(exc: BaseException, *, has_limit_details: bool) -> str:
+    detail = exc.non_limit_failure_message if isinstance(exc, ReviewEngineError) else None
+    if not detail and not has_limit_details:
+        detail = str(exc)
+    if not detail:
+        return ""
+
+    detail = redact_text(str(detail))
+    if len(detail) > 1000:
+        detail = detail[:1000] + "…"
+    detail = _make_code_fence_safe(detail)
+    return f"- 실패 원인:\n```\n{detail}\n```\n\n"
+
+
+def _code_span(text: str) -> str:
+    text = " ".join(text.splitlines())
+    longest_backtick_run = max(
+        (len(match.group(0)) for match in re.finditer(r"`+", text)), default=0
+    )
+    delimiter = "`" * (longest_backtick_run + 1)
+    if len(delimiter) == 1:
+        return f"`{text}`"
+    return f"{delimiter} {text} {delimiter}"
+
+
+def _budget_exceeded_message(
+    pr: PullRequest,
+    dump: FileDump,
+    *,
+    engine_label: str,
+    max_input_tokens_env: str,
+) -> str:
+    budget = dump.budget
+    max_tokens = budget.max_tokens if budget is not None else 0
+    included = len(dump.entries)
+    excluded = len(dump.excluded)
+    return (
+        f"⚠️ **{engine_label} — 컨텍스트 예산 초과**\n\n"
+        f"본 저장소의 전체 코드 크기가 설정된 입력 한도(`{max_input_tokens_env}={max_tokens}`)"
+        "를 초과하여 리뷰를 수행하지 않았습니다.\n\n"
+        f"- 포함된 파일: {included}개\n"
+        f"- 제외된 파일: {excluded}개 (변경 파일 일부 포함)\n\n"
+        "다음 중 하나를 조치해 주세요:\n"
+        "1. PR 범위를 줄여 변경 파일이 컨텍스트에 들어가도록 분할\n"
+        "2. `.reviewbot.yml` 제외 규칙 확장\n"
+        f"3. `{max_input_tokens_env}` 값을 상향 조정 (모델 컨텍스트 허용 범위 내)\n"
+    )
