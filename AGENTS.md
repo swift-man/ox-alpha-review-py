@@ -30,6 +30,12 @@ When availability and zero-cost safety conflict, choose safety and refuse servic
 - Reserve local quota atomically before inference. Count failures, cancellations,
   parse errors, stale-head results, and diff-only fallback calls. Never refund an
   attempt.
+- Hard-code the local quota to at most 45 attempts in the trailing 24-hour window
+  ending at each reservation. Persist each UTC reservation before transport; an
+  attempt expires only when its timestamp is at or before `now - 24 hours`. Process
+  restarts must restore the same unexpired reservations and must never reset the
+  window early. A clock rollback, corrupt or unreadable quota state, or failed
+  reservation must fail closed before transport.
 - Route every completion POST—including provisioning, latch-clear, and acceptance
   smoke calls—through the same quota-guarded transport. No second HTTP path may own
   the completion endpoint.
@@ -181,8 +187,8 @@ infrastructure (GitHub, OpenRouter, Git, SQLite adapters)
   acceptance tests only.
 - Test every fail-closed branch and assert zero completion HTTP requests were sent.
 - Test SQLite concurrency, corruption, permission failure, clock rollback, process
-  lock contention, crash-after-send state, delivery redelivery, and 45/46 quota
-  boundaries.
+  lock contention, crash-after-send state, delivery redelivery, restart restoration,
+  exact 24-hour expiry, and 45/46 quota boundaries.
 - Test exact request snapshots: model/provider IDs, disabled fallback, zero price
   ceilings, omitted paid features, and bounded output/input.
 - Test response identity, routing metadata, usage cost, parser bounds, diff-line
