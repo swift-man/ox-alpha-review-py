@@ -33,7 +33,7 @@ class ExclusiveProcessLock:
             flags |= getattr(os, "O_CLOEXEC", 0)
             flags |= getattr(os, "O_NOFOLLOW", 0)
             fd = os.open(self._path, flags, 0o600)
-            os.chmod(self._path, 0o600)
+            os.fchmod(fd, 0o600)
             mode = os.fstat(fd).st_mode
             if not stat.S_ISREG(mode) or stat.S_IMODE(mode) != 0o600:
                 raise StateSafetyError("process lock file is not a mode-0600 regular file")
