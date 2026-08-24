@@ -1,0 +1,93 @@
+version: 1
+
+review:
+  include:
+    # Python source and tests
+    - "src/**/*.py"
+    - "tests/**/*.py"
+
+    # Runtime, packaging, and quality gates
+    - "pyproject.toml"
+    - "requirements*.txt"
+    - "setup.cfg"
+    - "mypy.ini"
+    - "ruff.toml"
+    - ".ruff.toml"
+
+    # Operational files
+    - "scripts/**/*.py"
+    - "scripts/**/*.sh"
+    - "deploy/**/*.conf"
+    - ".github/workflows/**/*.yml"
+    - ".github/workflows/**/*.yaml"
+    - ".coderabbit.yaml"
+    - "Dockerfile"
+    - "docker-compose*.yml"
+    - "docker-compose*.yaml"
+
+  exclude:
+    # Dependencies and local environments
+    - ".venv/**"
+    - "venv/**"
+    - "env/**"
+    - "node_modules/**"
+    - "vendor/**"
+
+    # Build, test, coverage, and type-check output
+    - "__pycache__/**"
+    - "**/__pycache__/**"
+    - ".pytest_cache/**"
+    - ".mypy_cache/**"
+    - ".ruff_cache/**"
+    - ".tox/**"
+    - ".nox/**"
+    - ".coverage"
+    - "coverage.xml"
+    - "htmlcov/**"
+    - "dist/**"
+    - "build/**"
+    - "*.egg-info/**"
+
+    # Generated, binary, and bulky resources
+    - "docs/**"
+    - "site/**"
+    - "**/*.png"
+    - "**/*.jpg"
+    - "**/*.jpeg"
+    - "**/*.gif"
+    - "**/*.webp"
+    - "**/*.pdf"
+    - "**/*.mp4"
+    - "**/*.mov"
+
+    # Lock files
+    - "uv.lock"
+    - "poetry.lock"
+    - "Pipfile.lock"
+    - "package-lock.json"
+    - "yarn.lock"
+    - "pnpm-lock.yaml"
+
+    # Documentation and local-only configuration
+    - "README.md"
+    - "CHANGELOG.md"
+    - "**/*.md"
+    - ".env"
+    - ".env.*"
+    - "scripts/local_review_env.sh"
+
+  always_review:
+    - ".reviewbot.yml"
+    - ".gitignore"
+    - ".env.example"
+    - "AGENTS.md"
+    - "docs/compatibility-matrix.md"
+    - "pyproject.toml"
+    - "scripts/verify_free_only_setup.py"
+    - "src/ox_alpha_review/infrastructure/free_only_cost_guard.py"
+    - "src/ox_alpha_review/infrastructure/free_quota_ledger.py"
+    - "src/ox_alpha_review/infrastructure/inference_idempotency.py"
+    - "src/ox_alpha_review/infrastructure/safety_latch.py"
+    - "src/ox_alpha_review/infrastructure/ox_alpha_openrouter_engine.py"
+    - ".github/workflows/**/*.yml"
+    - ".github/workflows/**/*.yaml"
